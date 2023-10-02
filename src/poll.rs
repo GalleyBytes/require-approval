@@ -21,7 +21,7 @@ impl Response {
         if self.data.len() == 0 {
             return true;
         }
-        if self.data[0].status != "approved" && self.data[0].status != "canceled" {
+        if self.data[0].status != "complete" {
             return true;
         }
         false
@@ -31,7 +31,7 @@ impl Response {
         if self.is_nodata() {
             return false;
         }
-        self.data[0].status == "approved"
+        self.data[0].is_approved
     }
 }
 
@@ -44,6 +44,7 @@ struct StatusInfo {
 #[derive(Debug, Deserialize)]
 struct DataItem {
     status: String,
+    is_approved: bool,
 }
 
 #[derive(Debug)]
@@ -65,7 +66,10 @@ impl APIClient {
             reqwest::header::HeaderValue::from_str(self.token.as_str()).unwrap(),
         );
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?;
+
         let body = client
             .get(&self.url)
             .headers(headers)
@@ -114,8 +118,16 @@ pub fn poll() {
         token,
     );
     loop {
-        let response = client.query_approval().unwrap_or(String::from(""));
-        let status = response_check(response);
+        let response = client.query_approval();
+        let response_data = match response {
+            Ok(s) => s,
+            Err(e) => {
+                let err = e.unwrap();
+                println!("{}", err.to_string());
+                String::from("")
+            }
+        };
+        let status = response_check(response_data);
         match status {
             0 => {
                 println!("Canceled via database");
