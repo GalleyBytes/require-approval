@@ -21,7 +21,7 @@ impl Response {
         if self.data.len() == 0 {
             return true;
         }
-        if self.data[0].status != "approved" && self.data[0].status != "canceled" {
+        if self.data[0].status != "complete" {
             return true;
         }
         false
@@ -31,7 +31,7 @@ impl Response {
         if self.is_nodata() {
             return false;
         }
-        self.data[0].status == "approved"
+        self.data[0].is_approved
     }
 }
 
@@ -44,6 +44,7 @@ struct StatusInfo {
 #[derive(Debug, Deserialize)]
 struct DataItem {
     status: String,
+    is_approved: bool,
 }
 
 #[derive(Debug)]
@@ -80,6 +81,7 @@ impl APIClient {
 /// Return int where: 0=false, 1=true and anything else is nodata
 fn response_check(resp: String) -> i8 {
     let r: Response = serde_json::from_str(resp.as_str()).unwrap_or(Response::default());
+    println!("{:?}", r);
     if r.is_unauthorized() {
         println!("The request was unauthorized");
         exit(1);
@@ -115,7 +117,9 @@ pub fn poll() {
     );
     loop {
         let response = client.query_approval().unwrap_or(String::from(""));
+
         let status = response_check(response);
+
         match status {
             0 => {
                 println!("Canceled via database");
