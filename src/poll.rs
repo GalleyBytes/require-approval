@@ -66,7 +66,10 @@ impl APIClient {
             reqwest::header::HeaderValue::from_str(self.token.as_str()).unwrap(),
         );
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?;
+
         let body = client
             .get(&self.url)
             .headers(headers)
@@ -81,7 +84,6 @@ impl APIClient {
 /// Return int where: 0=false, 1=true and anything else is nodata
 fn response_check(resp: String) -> i8 {
     let r: Response = serde_json::from_str(resp.as_str()).unwrap_or(Response::default());
-    println!("{:?}", r);
     if r.is_unauthorized() {
         println!("The request was unauthorized");
         exit(1);
@@ -116,10 +118,16 @@ pub fn poll() {
         token,
     );
     loop {
-        let response = client.query_approval().unwrap_or(String::from(""));
-
-        let status = response_check(response);
-
+        let response = client.query_approval();
+        let response_data = match response {
+            Ok(s) => s,
+            Err(e) => {
+                let err = e.unwrap();
+                println!("{}", err.to_string());
+                String::from("")
+            }
+        };
+        let status = response_check(response_data);
         match status {
             0 => {
                 println!("Canceled via database");
