@@ -1,6 +1,17 @@
+use reqwest::StatusCode;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::fs::File;
+use std::io::Read;
+use std::thread;
+use std::time::Duration;
 use std::{env, process::exit};
 
-use serde::Deserialize;
+#[derive(Deserialize, Debug)]
+struct GenericTfoApiResponse {
+    //status_info: StatusInfo,
+    data: Option<Value>,
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct Response {
@@ -50,16 +61,35 @@ struct DataItem {
 #[derive(Debug)]
 struct APIClient {
     url: String,
+    refresh_url: String,
     token: String,
+    token_path: String,
+    refresh_token_path: String,
 }
 
 impl APIClient {
-    fn new(url: String, token: String) -> APIClient {
-        APIClient { url, token }
+    fn new(
+        url: String,
+        refresh_url: String,
+        token: String,
+        token_path: String,
+        refresh_token_path: String,
+    ) -> APIClient {
+        APIClient {
+            url,
+            refresh_url,
+            token,
+            token_path,
+            refresh_token_path,
+        }
+    }
+
+    fn read_refresh_token(&self) -> String {
+        read_file(&self.refresh_token_path).expect("Could not read file")
     }
 
     #[tokio::main]
-    async fn query_approval(&self) -> Result<String, Option<reqwest::Error>> {
+    async fn query_approval(&mut self) -> Result<String, Option<reqwest::Error>> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "TOKEN",
@@ -70,14 +100,79 @@ impl APIClient {
             .timeout(std::time::Duration::from_secs(3))
             .build()?;
 
-        let body = client
+        let response = client
             .get(&self.url)
-            .headers(headers)
+            .headers(headers.clone())
             .send()
-            .await?
-            .text()
             .await?;
+
+        if response.status() == StatusCode::UNAUTHORIZED {
+            // The token is expired or invalid
+            let mut refresh_attempts = 0;
+            let max_refresh_attempts = 6;
+            loop {
+                if refresh_attempts > max_refresh_attempts {
+                    break;
+                }
+                match self.get_new_token().await {
+                    Ok(token) => {
+                        println!("INFO new token found");
+                        self.token = token;
+                        return Ok("NEW_TOKEN".into());
+                    }
+                    Err(err) => {
+                        println!("ERROR {}", err);
+                        refresh_attempts += 1;
+                    }
+                }
+                thread::sleep(Duration::from_secs(15));
+            }
+        }
+
+        let body = response.text().await?;
         Ok(body)
+    }
+
+    /// First read token from disk. If unchanged, read the refresh_token from disk and request a new token.
+    async fn get_new_token(&self) -> Result<String, Box<dyn std::error::Error>> {
+        if self.token.trim() != read_file(&self.token_path)?.trim() {
+            return Ok(read_file(&self.token_path)?);
+        }
+
+        let client = reqwest::Client::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "Token",
+            reqwest::header::HeaderValue::from_str(self.token.as_str()).unwrap(),
+        );
+
+        let refresh_token = self.read_refresh_token();
+        let response = client
+            .post(&self.refresh_url)
+            .headers(headers)
+            .json(&json!({"refresh_token": refresh_token}))
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(response.text().await?.into());
+        } else {
+            let api_response = response.json::<GenericTfoApiResponse>().await?;
+            let data = api_response
+                .data
+                .expect("Refresh token response did not contain new JWT");
+            let arr = data
+                .as_array()
+                .expect("Refresh token repsosne was not properly formatted");
+            if arr.len() != 1 {
+                return Err("Refresh token response did not contain data".into());
+            }
+            let new_token = arr
+                .get(0)
+                .unwrap()
+                .as_str()
+                .expect("Refresh token data was not properly formatted");
+            return Ok(new_token.to_string());
+        }
     }
 }
 
@@ -97,11 +192,22 @@ fn response_check(resp: String) -> i8 {
     return r.is_approved() as i8;
 }
 
+fn read_file(filepath: &str) -> std::io::Result<String> {
+    let mut f = File::open(filepath)?;
+    let mut buffer = String::new();
+    f.read_to_string(&mut buffer)?;
+    Ok(buffer)
+}
+
 pub fn poll() {
     let url = env::var("TFO_API_URL").unwrap_or_default();
     let token = env::var("TFO_API_LOG_TOKEN").unwrap_or_default();
     let generation_path = env::var("TFO_GENERATION_PATH").expect("TFO_GENERATION_PATH");
     let pod_uid = env::var("POD_UID").expect("POD_UID");
+    let token_path =
+        env::var("TFO_API_TOKEN_PATH").unwrap_or(String::from("/jwt/TFO_API_LOG_TOKEN"));
+    let refresh_token_path =
+        env::var("TFO_API_REFRESH_TOKEN_PATH").unwrap_or(String::from("/jwt/REFRESH_TOKEN"));
 
     if url == String::from("") {
         println!("TFO_API_URL missing: skipping API approval-status check");
@@ -113,9 +219,12 @@ pub fn poll() {
         return;
     }
 
-    let client = APIClient::new(
+    let mut client = APIClient::new(
         format!("{}/api/v1/task/{}/approval-status", url, pod_uid),
+        format!("{}/refresh", url),
         token,
+        token_path,
+        refresh_token_path,
     );
     loop {
         let response = client.query_approval();
